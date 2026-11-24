@@ -1,0 +1,240 @@
+# RustDesk controlled-only single-file client
+#
+# Put this file at .github/workflows/custom-client.yml in your FORK of
+# rustdesk/rustdesk, together with tools/patch_client.py.
+# Then: Actions -> "Build controlled-only portable client" -> Run workflow.
+#
+# Output: controlled-only-portable/<name>.exe + a GitHub Release asset.
+
+name: Build controlled-only portable client
+
+on:
+  workflow_dispatch:
+    inputs:
+      rendezvous_server:
+        description: 'ID/中继服务器地址（域名或 IP，不要带端口）'
+        required: true
+        type: string
+      rs_pub_key:
+        description: '服务端公钥 id_ed25519.pub 的内容'
+        required: true
+        type: string
+      app_name:
+        description: '软件显示名（窗口标题、托盘、翻译替换）'
+        required: false
+        default: '西瓜远程'
+        type: string
+      exe_name:
+        description: '输出的 exe 文件名（不含 .exe，支持中文；默认 rustdesk）'
+        required: false
+        default: 'rustdesk'
+        type: string
+      autostart_name:
+        description: '开机自启注册表值名（仅 ASCII 字母/数字/_/./-）'
+        required: false
+        default: 'LollipopAssist'
+        type: string
+      preset_password:
+        description: '固定永久密码（留空=被控方在界面自行设置且跨重启记住；填写后编译进二进制并直接显示，勿含引号/反斜杠）'
+        required: false
+        default: ''
+        type: string
+      hint_text:
+        description: '被控端界面显示的一行提示文案'
+        required: false
+        default: '西瓜远程 · 本设备仅作为被控端；可设置自己的连接密码并开启开机自启，重启后仍然有效'
+        type: string
+      show_password:
+        description: '显示密码区（未设固定密码时显示随机临时密码）'
+        required: false
+        default: true
+        type: boolean
+      publish_release:
+        description: '构建成功后自动发布 GitHub Release'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+# Versions are copied from rustdesk/rustdesk master .github/workflows/flutter-build.yml
+# (verified 2026-11-23). Do NOT bump them independently: the custom Flutter engine
+# and the flutter-rust-bridge generated files are pinned to this exact toolchain.
+env:
+  FLUTTER_VERSION: "3.24.5"
+  SCITER_RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "1.5.3"
+  # Windows runners default Python stdout to cp1252 when piped; Chinese exe
+  # names then blow up with UnicodeEncodeError. Force UTF-8 everywhere.
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  # flutter-rust-bridge generated files are not committed; official CI builds them.
+  bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  # Helper DLL used by the Windows build (privacy mode / topmost window).
+  topmost:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  build:
+    needs: [bridge, topmost]
+    runs-on: windows-2022
+    steps:
+      # vcpkg's x-gha binary cache needs these two runtime variables exported.
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source (with submodules)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Apply the controlled-only patch
+        shell: bash
+        env:
+          RD_SERVER: ${{ inputs.rendezvous_server }}
+          RD_PUB_KEY: ${{ inputs.rs_pub_key }}
+          RD_APP_NAME: ${{ inputs.app_name }}
+          RD_AUTOSTART_NAME: ${{ inputs.autostart_name }}
+          RD_PRESET_PASSWORD: ${{ inputs.preset_password }}
+          RD_HINT: ${{ inputs.hint_text }}
+          RD_SHOW_PASSWORD: ${{ inputs.show_password && '1' || '0' }}
+        run: |
+          python3 tools/patch_client.py
+          echo "--- patched constants ---"
+          grep -n "RENDEZVOUS_SERVERS\|RS_PUB_KEY" libs/hbb_common/src/config.rs | head -4
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      - name: Replace engine with rustdesk custom flutter engine
+        shell: pwsh
+        run: |
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/* C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch Flutter 3.24.5 dropdown
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$(dirname "$(dirname "$(which flutter)")")"
+          cd "$(dirname "$(dirname "$(which flutter)")")" || exit 1
+          if [[ "${{ env.FLUTTER_VERSION }}" == "3.24.5" ]]; then
+            git apply flutter_3.24.4_dropdown_menu_enableFilter.diff || echo "dropdown patch already applied"
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          "$VCPKG_ROOT/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Build rustdesk (Flutter, portable, no MSI)
+        shell: pwsh
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec
+          if (-not (Test-Path ./flutter/build/windows/x64/runner/Release/rustdesk.exe)) {
+            throw "rustdesk.exe was not produced"
+          }
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+      - name: Add helper DLL
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: ./rustdesk
+
+      - name: Build single-file self-extracting exe
+        shell: bash
+        env:
+          EXE_NAME: ${{ inputs.exe_name }}
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          python3 -m pip install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          popd
+          mkdir -p ./out
+          PACKER=$(find . -name "rustdesk-portable-packer.exe" -type f | head -1)
+          if [ -z "$PACKER" ]; then
+            echo "portable packer output not found"; find . -name "*.exe" | head -30; exit 1
+          fi
+          # Write raw UTF-8 bytes instead of print(): on Windows runners the
+          # piped stdout uses cp1252 and print() of non-ASCII raises
+          # UnicodeEncodeError even with PYTHONIOENCODING set.
+          NAME=$(python3 -c 'import re,sys; s=re.sub(r"[^\w.\-]", "", sys.argv[1], flags=re.UNICODE).lstrip("."); sys.stdout.buffer.write((s[:60] or "client").encode("utf-8"))' "$EXE_NAME")
+          cp "$PACKER" "./out/$NAME.exe"
+          ls -lh "./out/$NAME.exe"
+
+      - name: Upload the single exe
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: controlled-only-portable
+          path: ./out/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          gh release create "$TAG" ./out/*.exe \
+            --repo "${{ github.repository }}" \
+            --title "单文件被控端 #${{ github.run_number }}" \
+            --notes "纯被控端 · 中继地址与公钥编译进二进制 · 免安装单文件 · 被控方可自设密码并跨重启记住 · 可开启开机自启 · 无任何设置页"
+          echo "Release $TAG published"
